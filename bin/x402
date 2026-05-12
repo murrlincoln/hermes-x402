@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Wrapper so `x402` can be put on PATH while running TS directly via tsx.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
+PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+exec npx --prefix "$PROJECT_DIR" tsx "$PROJECT_DIR/src/cli/index.ts" "$@"

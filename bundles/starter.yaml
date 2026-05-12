@@ -1,0 +1,39 @@
+name: starter
+version: 0.0.1
+description: |
+  Pay-per-use AI inference, no API keys. Wallet-funded via x402.
+  Cheapest bundle — just talks to Venice for chat + embeddings.
+
+provider: venice
+chain: base
+spend_asset: USDC
+
+endpoints:
+  - kind: openai-compatible
+    via: bridge
+    url: http://127.0.0.1:8402/v1
+
+models:
+  - id: llama-3.3-70b
+    role: primary
+    notes: balanced default
+  - id: llama-3.2-3b
+    role: fast
+    notes: cheap, fast, good for the metabolic experiment
+  - id: hermes-3-llama-3.1-405b
+    role: heavy
+    notes: Nous Hermes 3 405b — flagship
+  - id: qwen3-235b-a22b-instruct-2507
+    role: heavy_moe
+    notes: Qwen3 235B MoE
+
+est_cost_per_hour_usdc: 0.05   # rough — depends on usage
+
+skills: []
+mcp_servers: []
+
+hermes_config_patch:
+  model:
+    default: llama-3.3-70b
+    provider: custom
+    base_url: http://127.0.0.1:8402/v1
