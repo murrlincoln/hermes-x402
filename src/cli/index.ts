@@ -3,7 +3,7 @@ import { Command } from 'commander'
 import chalk from 'chalk'
 import ora from 'ora'
 import qrcode from 'qrcode-terminal'
-import { parse as parseYaml, stringify as stringifyYaml, parseDocument } from 'yaml'
+import { parse as parseYaml, parseDocument } from 'yaml'
 import {
   readFileSync,
   writeFileSync,
@@ -23,7 +23,10 @@ import {
   saveWallet,
   loadWallet,
   walletExists,
+  walletFromPrivateKey,
 } from '../lib/wallet.js'
+import { WALLET_PROVIDERS, type ProviderId } from '../lib/wallet-providers.js'
+import { select, password, confirm } from '@inquirer/prompts'
 import { getVeniceClient, fetchBalance } from '../lib/venice.js'
 import {
   spendSince,
@@ -56,27 +59,45 @@ program
 
 program
   .command('init')
-  .description('Generate a wallet and apply a bundle (default: starter)')
-  .option('-b, --bundle <name>', 'Bundle to install', 'starter')
+  .description('Interactive onboarding: pick a wallet, pick a bundle, fund')
+  .option('-b, --bundle <name>', 'Skip the bundle picker and install this one')
+  .option('-y, --yes', 'Non-interactive: defaults (generate wallet, starter bundle)')
   .option('--no-patch', 'Skip patching ~/.hermes/config.yaml')
   .action(async (opts) => {
+    const nonInteractive = opts.yes === true || !process.stdin.isTTY
+
+    console.log()
+    console.log(chalk.bold('  Welcome to hermes-x402.'))
+    console.log(chalk.dim('  Wallet-funded onboarding for Hermes Agent — no API keys.'))
+    console.log()
+
+    // ── Step 1 of 3: Wallet ────────────────────────────────────────────
+    sectionHeader('Step 1 of 3', 'Wallet')
+
     if (walletExists()) {
       const w = loadWallet()
-      console.log(chalk.yellow(`Wallet already exists at ${WALLET_PATH}`))
-      console.log(`  ${chalk.bold('address:')} ${w.address}`)
-    } else {
-      const spin = ora('Generating wallet').start()
-      const w = generateWallet()
-      saveWallet(w)
-      spin.succeed(`Wallet created at ${WALLET_PATH}`)
-      console.log(`  ${chalk.bold('address:')} ${w.address}`)
+      console.log(`  ${chalk.green('✓')} wallet already configured`)
+      console.log(`    ${chalk.bold('address:')} ${w.address}`)
       console.log(
-        chalk.dim(`  (private key chmod 600, stored at ${WALLET_PATH})`),
+        chalk.dim(`    (stored at ${WALLET_PATH}; chmod 600)`),
       )
+    } else {
+      const providerId: ProviderId = nonInteractive
+        ? 'local-generate'
+        : await pickWalletProvider()
+      await setupWallet(providerId)
     }
 
-    const bundle = loadBundle(opts.bundle)
-    console.log(`\n${chalk.bold('Bundle:')} ${bundle.name}  ${chalk.dim(bundle.description?.trim().split('\n')[0] ?? '')}`)
+    // ── Step 2 of 3: Inference & skills ─────────────────────────────────
+    console.log()
+    sectionHeader('Step 2 of 3', 'Inference & skills')
+
+    const bundleName: string =
+      opts.bundle ?? (nonInteractive ? 'starter' : await pickBundle())
+    const bundle = loadBundle(bundleName)
+    console.log(
+      `  ${chalk.bold('bundle:')} ${chalk.cyan(bundle.name)}  ${chalk.dim(bundle.description?.trim().split('\n')[0] ?? '')}`,
+    )
 
     if (opts.patch !== false) {
       patchHermesConfig(bundle)
@@ -84,14 +105,37 @@ program
       console.log(chalk.dim('  (--no-patch given, leaving Hermes config alone)'))
     }
 
-    const w = loadWallet()
+    // ── Step 3 of 3: Fund ───────────────────────────────────────────────
     console.log()
-    console.log(chalk.bold.green('Next steps:'))
-    console.log(`  1. Send ${chalk.bold('$5 USDC on Base')} to ${chalk.cyan(w.address)}`)
-    console.log(`     ${chalk.dim('(USDC on Base contract: 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913)')}`)
-    console.log(`  2. ${chalk.bold('x402 balance')} — confirm funds arrived`)
-    console.log(`  3. ${chalk.bold('x402 start')} — launch the bridge`)
-    console.log(`  4. In another terminal: ${chalk.bold('hermes')} — talk to your agent`)
+    sectionHeader('Step 3 of 3', 'Fund the wallet')
+
+    const w = loadWallet()
+    console.log(`  ${chalk.bold('address:')}  ${chalk.cyan(w.address)}`)
+    console.log(`  ${chalk.bold('network:')}  Base mainnet`)
+    console.log(
+      `  ${chalk.bold('asset:')}    USDC  ${chalk.dim('(0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913)')}`,
+    )
+    console.log(`  ${chalk.bold('amount:')}   $5+ to start`)
+
+    if (!nonInteractive) {
+      const showQr = await confirm({
+        message: 'Show a QR code for the address?',
+        default: false,
+      }).catch(() => false)
+      if (showQr) {
+        console.log()
+        qrcode.generate(w.address, { small: true })
+      }
+    }
+
+    console.log()
+    console.log(chalk.bold.green('  Done. When funds arrive:'))
+    console.log(`    ${chalk.bold('x402 balance')}              confirm funds arrived`)
+    console.log(`    ${chalk.bold('x402 topup 5')}              convert on-chain USDC → Venice balance`)
+    console.log(`    ${chalk.bold('x402 start --daemon')}       run the bridge in the background`)
+    console.log(`    ${chalk.bold('x402 install-mcp')}          register the x402_fetch tool with Hermes`)
+    console.log(`    ${chalk.bold('hermes')}                    talk to your agent`)
+    console.log()
   })
 
 // ------------------------------------------------------------------------
@@ -383,16 +427,21 @@ program
       console.error(chalk.red(`MCP server file missing: ${serverPath}`))
       process.exit(1)
     }
-    console.log(chalk.dim(`Running: hermes mcp add ${opts.name} --command npx --args tsx ${serverPath}`))
-    const r = spawnSync(
-      'hermes',
-      ['mcp', 'add', opts.name, '--command', 'npx', '--args', 'tsx', serverPath],
-      { stdio: 'inherit' },
-    )
-    if (r.status !== 0) {
-      console.error(chalk.red(`hermes mcp add exited with ${r.status}`))
-      process.exit(r.status ?? 1)
+    if (!existsSync(HERMES_CONFIG)) {
+      console.error(chalk.red(`${HERMES_CONFIG} not found — install Hermes first`))
+      process.exit(1)
     }
+    const backup = HERMES_CONFIG + '.bak.' + Date.now()
+    copyFileSync(HERMES_CONFIG, backup)
+    const result = upsertMcpServer(
+      readFileSync(HERMES_CONFIG, 'utf-8'),
+      opts.name,
+      'npx',
+      ['tsx', serverPath],
+    )
+    writeFileSync(HERMES_CONFIG, result.text)
+    console.log(`${result.action} ${chalk.cyan(opts.name)} in ${HERMES_CONFIG}`)
+    console.log(chalk.dim(`  backup: ${backup}`))
     console.log()
     console.log(chalk.green('Registered. The agent now has these tools:'))
     console.log(`  ${chalk.bold('x402_fetch')}       pay any x402 endpoint with your wallet`)
@@ -527,6 +576,105 @@ function parseSince(spec: string): Date {
   return new Date(Date.now() - ms)
 }
 
+function sectionHeader(step: string, title: string): void {
+  const bar = '─'.repeat(56)
+  console.log(`  ${chalk.dim(bar)}`)
+  console.log(`  ${chalk.dim(step)}  ${chalk.bold(title)}`)
+  console.log(`  ${chalk.dim(bar)}`)
+}
+
+async function pickWalletProvider(): Promise<ProviderId> {
+  return await select<ProviderId>({
+    message: 'How do you want to provide a wallet?',
+    choices: WALLET_PROVIDERS.map((p) => ({
+      name:
+        p.label +
+        (p.status === 'coming-soon'
+          ? chalk.yellow('  (coming soon)')
+          : p.recommended
+            ? chalk.green('  (recommended)')
+            : ''),
+      value: p.id,
+      description: p.description,
+    })),
+  })
+}
+
+async function setupWallet(providerId: ProviderId): Promise<void> {
+  if (providerId === 'local-generate') {
+    const spin = ora('Generating wallet').start()
+    const w = generateWallet()
+    saveWallet(w)
+    spin.succeed(`Wallet created at ${WALLET_PATH}`)
+    console.log(`    ${chalk.bold('address:')} ${w.address}`)
+    console.log(chalk.dim(`    (private key chmod 600)`))
+    return
+  }
+  if (providerId === 'local-import') {
+    let pk: string
+    try {
+      pk = await password({
+        message:
+          'Paste private key (hidden — must start with 0x or be 64-char hex):',
+        mask: '*',
+      })
+    } catch {
+      console.log(chalk.red('  cancelled'))
+      process.exit(1)
+    }
+    let wallet
+    try {
+      wallet = walletFromPrivateKey(pk)
+    } catch (err) {
+      console.error(chalk.red(`  Invalid private key: ${(err as Error).message}`))
+      process.exit(1)
+    }
+    saveWallet(wallet)
+    console.log(`  ${chalk.green('✓')} imported wallet`)
+    console.log(`    ${chalk.bold('address:')} ${wallet.address}`)
+    console.log(chalk.dim(`    (private key chmod 600)`))
+    return
+  }
+  // coming-soon providers
+  const provider = WALLET_PROVIDERS.find((p) => p.id === providerId)
+  console.log()
+  console.log(
+    chalk.yellow(`  ${provider?.label} is not implemented yet.`),
+  )
+  console.log(
+    chalk.dim('  Tracking in NEXTSTEPS.md (P0 — wallet provider abstraction).'),
+  )
+  const proceed = await confirm({
+    message: 'Generate a local keypair for now instead?',
+    default: true,
+  }).catch(() => false)
+  if (!proceed) {
+    console.log(chalk.red('  Aborting init.'))
+    process.exit(1)
+  }
+  await setupWallet('local-generate')
+}
+
+async function pickBundle(): Promise<string> {
+  const files = readdirSync(BUNDLES_DIR).filter((f) => f.endsWith('.yaml'))
+  if (files.length === 1) {
+    const only = basename(files[0], '.yaml')
+    console.log(chalk.dim(`  (only one bundle available: ${only})`))
+    return only
+  }
+  return await select<string>({
+    message: 'Which bundle do you want to start with?',
+    choices: files.map((f) => {
+      const b = loadBundle(basename(f, '.yaml'))
+      return {
+        name: b.name,
+        value: b.name,
+        description: b.description?.trim().split('\n')[0] ?? '',
+      }
+    }),
+  })
+}
+
 function getCurrentHermesModel(): string | null {
   if (!existsSync(HERMES_CONFIG)) return null
   try {
@@ -568,24 +716,158 @@ function patchHermesConfig(bundle: Bundle): void {
   const backup = HERMES_CONFIG + '.bak.' + Date.now()
   copyFileSync(HERMES_CONFIG, backup)
 
-  // Use parseDocument to preserve as much structure as possible.
-  const raw = readFileSync(HERMES_CONFIG, 'utf-8')
-  const doc = parseDocument(raw)
+  // Targeted line-level rewrites: preserves comments + layout instead of
+  // round-tripping through a YAML AST (which strips comments).
   const patch = bundle.hermes_config_patch as Record<string, Record<string, unknown>>
+  let text = readFileSync(HERMES_CONFIG, 'utf-8')
+  const applied: Array<[string, string, unknown]> = []
   for (const [section, kv] of Object.entries(patch)) {
     for (const [key, value] of Object.entries(kv)) {
-      doc.setIn([section, key], value)
+      const result = setYamlKeyInSection(text, section, key, value)
+      if (result.changed) {
+        text = result.text
+        applied.push([section, key, value])
+      } else {
+        console.log(
+          chalk.yellow(`    ⚠ could not find ${section}.${key} in config; left unchanged`),
+        )
+      }
     }
   }
-  writeFileSync(HERMES_CONFIG, doc.toString())
+  writeFileSync(HERMES_CONFIG, text)
   console.log(
     `  patched ${chalk.cyan(HERMES_CONFIG)} ${chalk.dim('(backup: ' + backup + ')')}`,
   )
-  for (const [section, kv] of Object.entries(patch)) {
-    for (const [key, value] of Object.entries(kv)) {
-      console.log(
-        `    ${chalk.dim(section + '.')}${chalk.bold(key)} = ${JSON.stringify(value)}`,
-      )
+  for (const [section, key, value] of applied) {
+    console.log(
+      `    ${chalk.dim(section + '.')}${chalk.bold(key)} = ${JSON.stringify(value)}`,
+    )
+  }
+}
+
+// Replace a key=value inside a top-level section, preserving comments + indentation.
+// Returns the updated text + whether a change was made.
+function setYamlKeyInSection(
+  text: string,
+  section: string,
+  key: string,
+  value: unknown,
+): { text: string; changed: boolean } {
+  const lines = text.split('\n')
+  let inSection = false
+  let sectionIndent = 0
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]
+    const trimmed = line.trimStart()
+    const indent = line.length - trimmed.length
+
+    if (!inSection) {
+      if (trimmed.startsWith(`${section}:`)) {
+        inSection = true
+        sectionIndent = indent
+      }
+      continue
+    }
+    // We left the section when we see a line whose indent <= sectionIndent and is non-blank
+    if (trimmed.length > 0 && !trimmed.startsWith('#') && indent <= sectionIndent) {
+      // Section ended without finding the key
+      return { text, changed: false }
+    }
+    // Match `<indent>key:` (allow optional comment after value)
+    const keyMatch = new RegExp(`^(\\s+)${escapeRegex(key)}:\\s*.*$`)
+    const m = line.match(keyMatch)
+    if (m) {
+      const formatted = formatYamlScalar(value)
+      lines[i] = `${m[1]}${key}: ${formatted}`
+      return { text: lines.join('\n'), changed: true }
     }
   }
+  return { text, changed: false }
+}
+
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+// Add or update an MCP server entry under `mcp_servers:` without rewriting the
+// whole config (so comments survive). If `mcp_servers:` doesn't exist yet, we
+// append a new top-level block.
+function upsertMcpServer(
+  text: string,
+  name: string,
+  command: string,
+  args: string[],
+): { text: string; action: string } {
+  const block = [
+    `  ${name}:`,
+    `    command: ${command}`,
+    `    args:`,
+    ...args.map((a) => `    - ${a}`),
+    `    enabled: true`,
+  ].join('\n')
+
+  const lines = text.split('\n')
+  let mcpIdx = -1
+  for (let i = 0; i < lines.length; i++) {
+    if (/^mcp_servers:\s*(\{\s*\})?\s*$/.test(lines[i]) || /^mcp_servers:\s*$/.test(lines[i])) {
+      mcpIdx = i
+      break
+    }
+  }
+
+  if (mcpIdx === -1) {
+    // Append at end of file
+    const sep = text.endsWith('\n') ? '' : '\n'
+    return {
+      text: text + sep + '\nmcp_servers:\n' + block + '\n',
+      action: 'added',
+    }
+  }
+
+  // Find the existing block for this name within mcp_servers (indent 2)
+  // If present, replace it; else insert after `mcp_servers:` line.
+  let entryStart = -1
+  let entryEnd = -1
+  for (let i = mcpIdx + 1; i < lines.length; i++) {
+    const line = lines[i]
+    const trimmed = line.trimStart()
+    const indent = line.length - trimmed.length
+    if (trimmed.length === 0 || trimmed.startsWith('#')) continue
+    if (indent === 0) {
+      // left mcp_servers section
+      if (entryStart !== -1) entryEnd = i
+      break
+    }
+    if (indent === 2 && trimmed.startsWith(`${name}:`)) {
+      entryStart = i
+      continue
+    }
+    if (entryStart !== -1 && indent <= 2) {
+      // we left the entry — next sibling or end
+      entryEnd = i
+      break
+    }
+  }
+  if (entryStart !== -1) {
+    if (entryEnd === -1) entryEnd = lines.length
+    const newLines = [...lines.slice(0, entryStart), ...block.split('\n'), ...lines.slice(entryEnd)]
+    return { text: newLines.join('\n'), action: 'updated' }
+  }
+  // Need to convert "mcp_servers: {}" or "mcp_servers:" into a block
+  if (/^mcp_servers:\s*\{\s*\}\s*$/.test(lines[mcpIdx])) {
+    lines[mcpIdx] = 'mcp_servers:'
+  }
+  const newLines = [...lines.slice(0, mcpIdx + 1), ...block.split('\n'), ...lines.slice(mcpIdx + 1)]
+  return { text: newLines.join('\n'), action: 'added' }
+}
+
+function formatYamlScalar(v: unknown): string {
+  if (typeof v === 'string') {
+    // Always quote strings to avoid yaml ambiguity (e.g. "yes", "true", IP-like)
+    return `"${v.replace(/"/g, '\\"')}"`
+  }
+  if (typeof v === 'number' || typeof v === 'boolean' || v === null) {
+    return String(v)
+  }
+  return JSON.stringify(v)
 }

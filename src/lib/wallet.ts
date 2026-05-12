@@ -18,6 +18,19 @@ export function generateWallet(): WalletFile {
   }
 }
 
+export function walletFromPrivateKey(privateKey: string): WalletFile {
+  const key = privateKey.trim().startsWith('0x')
+    ? privateKey.trim()
+    : '0x' + privateKey.trim()
+  // Wallet constructor throws if invalid
+  const w = new Wallet(key)
+  return {
+    address: w.address,
+    privateKey: w.privateKey,
+    createdAt: new Date().toISOString(),
+  }
+}
+
 export function saveWallet(file: WalletFile, path = WALLET_PATH): void {
   mkdirSync(dirname(path), { recursive: true })
   writeFileSync(path, JSON.stringify(file, null, 2))

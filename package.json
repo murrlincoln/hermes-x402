@@ -19,6 +19,7 @@
     "node": ">=20"
   },
   "dependencies": {
+    "@inquirer/prompts": "^8.4.3",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@x402/core": "^2.11.0",
     "@x402/evm": "^2.11.0",
