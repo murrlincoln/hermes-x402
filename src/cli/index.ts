@@ -139,6 +139,21 @@ program
         `  ${chalk.bold('bundle:')} ${chalk.cyan(bundle.name)}  ${chalk.dim(bundle.description?.trim().split('\n')[0] ?? '')}`,
       )
 
+      if (bundle.models && bundle.models.length > 0) {
+        const primary = bundle.models.find((m) => m.role === 'primary')
+        if (primary) {
+          console.log(`  ${chalk.bold('model:')}  ${chalk.green(primary.id)}  ${chalk.dim(primary.notes ?? '')}`)
+        }
+        const others = bundle.models.filter((m) => m.role !== 'primary')
+        if (others.length > 0) {
+          console.log(chalk.dim(`  also available: ${others.map((m) => m.id).join(', ')}`))
+        }
+      }
+      if (bundle.est_cost_per_hour_usdc) {
+        console.log(`  ${chalk.bold('est. cost:')} ~${chalk.cyan('$' + bundle.est_cost_per_hour_usdc.toFixed(2))}/hour`)
+      }
+      console.log()
+
       if (bundle.x402_skills && bundle.x402_skills.length > 0) {
         const bundleSkillsSpin = ora('Adding skills from bundle').start()
         try {
@@ -765,12 +780,20 @@ program.parseAsync().catch((err) => {
 // helpers
 // ------------------------------------------------------------------------
 
+interface BundleModel {
+  id: string
+  role: string
+  notes?: string
+}
+
 interface Bundle {
   name: string
   version?: string
   description?: string
   hermes_config_patch?: Record<string, unknown>
   x402_skills?: string[]
+  models?: BundleModel[]
+  est_cost_per_hour_usdc?: number
 }
 
 function loadBundle(name: string): Bundle {
