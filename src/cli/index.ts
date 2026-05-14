@@ -82,7 +82,6 @@ program
   .option('-b, --bundle <name>', 'Skip the bundle picker and install this one')
   .option('-y, --yes', 'Non-interactive: defaults (generate wallet, starter bundle, no marketplace)')
   .option('--no-patch', 'Skip patching ~/.hermes/config.yaml')
-  .option('--skip-marketplace', 'Skip the skill marketplace step')
   .action(async (opts) => {
     const nonInteractive = opts.yes === true || !process.stdin.isTTY
 
@@ -92,8 +91,8 @@ program
     console.log(chalk.dim('  Your agent gets a wallet, picks skills, and is ready to go.'))
     console.log()
 
-    // ── Step 1 of 5: Wallet ────────────────────────────────────────────
-    sectionHeader('Step 1 of 5', 'Wallet')
+    // ── Step 1 of 3: Wallet ────────────────────────────────────────────
+    sectionHeader('Step 1 of 3', 'Wallet')
 
     if (walletExists()) {
       const w = loadWallet()
@@ -109,89 +108,63 @@ program
       await setupWallet(providerId)
     }
 
-    // ── Step 2 of 5: Check on-chain balance ────────────────────────────
-    console.log()
-    sectionHeader('Step 2 of 5', 'Wallet balance')
-
     const wallet = loadWallet()
     const balSpin = ora('Checking on-chain USDC balance on Base').start()
     try {
       const onChainBalance = await getUsdcBalance(wallet.address)
       balSpin.stop()
-      console.log(`  ${chalk.bold('address:')}  ${chalk.cyan(wallet.address)}`)
-      console.log(`  ${chalk.bold('USDC:')}     ${onChainBalance > 0 ? chalk.green(formatUsdc(onChainBalance)) : chalk.yellow('$0.00')}`)
-      console.log(`  ${chalk.bold('network:')}  Base mainnet`)
+      console.log(`  ${chalk.bold('USDC:')}     ${onChainBalance > 0 ? chalk.green(formatUsdc(onChainBalance)) : chalk.yellow('$0.00')} on Base`)
       if (onChainBalance === 0) {
-        console.log()
         console.log(chalk.yellow('  No USDC detected. Send USDC on Base to this address to use paid services.'))
         console.log(chalk.dim(`  You can continue setup now and fund later.`))
       }
     } catch (err) {
       balSpin.fail(`Could not check balance: ${(err as Error).message}`)
-      console.log(chalk.dim('  Continuing setup — you can check later with `x402 balance`'))
     }
 
-    // ── Step 3 of 5: Skill marketplace ─────────────────────────────────
-    if (!nonInteractive && !opts.skipMarketplace) {
-      console.log()
-      sectionHeader('Step 3 of 5', 'x402 Skills Marketplace')
-      console.log(chalk.dim('  Browse paid API services your agent can use. Each call is paid from your wallet.'))
-      console.log()
-
-      const wantSkills = await confirm({
-        message: 'Browse the x402 skills marketplace?',
-        default: true,
-      }).catch(() => false)
-
-      if (wantSkills) {
-        await interactiveSkillBrowser()
-      } else {
-        console.log(chalk.dim('  Skipped. You can browse later with `x402 marketplace`'))
-      }
-    } else {
-      console.log()
-      sectionHeader('Step 3 of 5', 'x402 Skills Marketplace')
-      console.log(chalk.dim('  Skipped (non-interactive mode). Use `x402 marketplace` to browse later.'))
-    }
-
-    // ── Step 4 of 5: Inference bundle ──────────────────────────────────
+    // ── Step 2 of 3: Skills ────────────────────────────────────────────
     console.log()
-    sectionHeader('Step 4 of 5', 'Inference bundle')
+    sectionHeader('Step 2 of 3', 'Skills')
 
-    const bundleName: string =
-      opts.bundle ?? (nonInteractive ? 'starter' : await pickBundle())
-    const bundle = loadBundle(bundleName)
-    console.log(
-      `  ${chalk.bold('bundle:')} ${chalk.cyan(bundle.name)}  ${chalk.dim(bundle.description?.trim().split('\n')[0] ?? '')}`,
-    )
+    const bundleChoice: string = opts.bundle ?? (nonInteractive ? 'starter' : await pickBundleOrCustom())
 
-    if (opts.patch !== false) {
-      patchHermesConfig(bundle)
+    let bundle: Bundle | null = null
+    if (bundleChoice === 'custom') {
+      console.log(chalk.dim('  Build your own skill set from the x402 marketplace.'))
+      console.log()
+      await interactiveSkillBrowser()
     } else {
-      console.log(chalk.dim('  (--no-patch given, leaving Hermes config alone)'))
-    }
+      bundle = loadBundle(bundleChoice)
+      console.log(
+        `  ${chalk.bold('bundle:')} ${chalk.cyan(bundle.name)}  ${chalk.dim(bundle.description?.trim().split('\n')[0] ?? '')}`,
+      )
 
-    if (bundle.x402_skills && bundle.x402_skills.length > 0) {
-      const bundleSkillsSpin = ora('Adding x402 skills from bundle').start()
-      try {
-        const catalog = await fetchCatalog()
-        let added = 0
-        for (const skillId of bundle.x402_skills) {
-          const service = catalog.find((s) => s.id === skillId)
-          if (service) {
-            addSelectedService(service)
-            added++
+      if (bundle.x402_skills && bundle.x402_skills.length > 0) {
+        const bundleSkillsSpin = ora('Adding skills from bundle').start()
+        try {
+          const catalog = await fetchCatalog()
+          let added = 0
+          for (const skillId of bundle.x402_skills) {
+            const service = catalog.find((s) => s.id === skillId)
+            if (service) {
+              addSelectedService(service)
+              added++
+            }
           }
+          bundleSkillsSpin.succeed(`Added ${added} skill${added !== 1 ? 's' : ''} from ${bundle.name} bundle`)
+        } catch {
+          bundleSkillsSpin.warn('Could not fetch marketplace catalog for bundle skills')
         }
-        bundleSkillsSpin.succeed(`Added ${added} skill${added !== 1 ? 's' : ''} from ${bundle.name} bundle`)
-      } catch {
-        bundleSkillsSpin.warn('Could not fetch marketplace catalog for bundle skills')
       }
     }
 
-    // ── Step 5 of 5: Auto-configure ────────────────────────────────────
+    if (bundle && opts.patch !== false) {
+      patchHermesConfig(bundle)
+    }
+
+    // ── Step 3 of 3: Configure ─────────────────────────────────────────
     console.log()
-    sectionHeader('Step 5 of 5', 'Auto-configure Hermes')
+    sectionHeader('Step 3 of 3', 'Configure')
 
     const skillsConfig = loadSkillsConfig()
     if (skillsConfig.selectedServices.length > 0) {
@@ -913,6 +886,31 @@ async function pickBundle(): Promise<string> {
         description: b.description?.trim().split('\n')[0] ?? '',
       }
     }),
+  })
+}
+
+async function pickBundleOrCustom(): Promise<string> {
+  const files = readdirSync(BUNDLES_DIR).filter((f) => f.endsWith('.yaml'))
+  const bundles = files.map((f) => {
+    const b = loadBundle(basename(f, '.yaml'))
+    const skillCount = b.x402_skills?.length ?? 0
+    const skillLabel = skillCount > 0 ? chalk.dim(` (${skillCount} skills)`) : ''
+    return {
+      name: `${b.name}${skillLabel}`,
+      value: b.name,
+      description: b.description?.trim().split('\n')[0] ?? '',
+    }
+  })
+  return await select<string>({
+    message: 'Pick a skill set for your agent',
+    choices: [
+      ...bundles,
+      {
+        name: `custom ${chalk.dim('— pick individual skills from the marketplace')}`,
+        value: 'custom',
+        description: 'Browse 700+ paid API services and choose exactly what you want.',
+      },
+    ],
   })
 }
 
