@@ -10,11 +10,21 @@ import { X402_HOME } from './paths.js'
 // Types
 // ---------------------------------------------------------------------------
 
+export interface EndpointParameter {
+  name: string
+  type: string
+  description?: string
+  example?: unknown
+  required?: boolean
+  group?: string
+}
+
 export interface MarketplaceEndpoint {
   url: string
   method: string
   description: string
   pricing?: { amount: string; currency: string }
+  parameters?: EndpointParameter[]
 }
 
 export interface MarketplaceService {
@@ -152,6 +162,14 @@ export async function fetchCatalog(forceRefresh = false): Promise<MarketplaceSer
       method?: string
       description?: string
       pricing?: { amount?: string; currency?: string }
+      parameters?: Array<{
+        name?: string
+        type?: string
+        description?: string
+        example?: unknown
+        required?: boolean
+        group?: string
+      }>
     }>
   }>
 
@@ -165,6 +183,16 @@ export async function fetchCatalog(forceRefresh = false): Promise<MarketplaceSer
         pricing: ep.pricing?.amount
           ? { amount: ep.pricing.amount, currency: ep.pricing.currency ?? 'USDC' }
           : undefined,
+        parameters: (ep.parameters ?? [])
+          .filter((p) => p.name)
+          .map((p) => ({
+            name: p.name!,
+            type: p.type ?? 'string',
+            description: p.description,
+            example: p.example,
+            required: p.required,
+            group: p.group,
+          })),
       }))
       return {
         id: s.id!,
