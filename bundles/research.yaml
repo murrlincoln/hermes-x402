@@ -1,0 +1,42 @@
+name: research
+version: 0.0.1
+description: |
+  AI inference + web search + data tools. Perfect for research agents.
+  Includes Exa (web search), Firecrawl (web scraping), Perplexity, and Venice inference.
+
+provider: venice
+chain: base
+spend_asset: USDC
+
+endpoints:
+  - kind: openai-compatible
+    via: bridge
+    url: http://127.0.0.1:8402/v1
+
+models:
+  - id: llama-3.3-70b
+    role: primary
+    notes: balanced default for research tasks
+  - id: qwen3-235b-a22b-instruct-2507
+    role: heavy_moe
+    notes: strong reasoning for complex analysis
+  - id: hermes-3-llama-3.1-405b
+    role: heavy
+    notes: flagship for deep research
+
+est_cost_per_hour_usdc: 0.15
+
+x402_skills:
+  - exa-ai
+  - api-firecrawl-dev
+  - docs-perplexity-ai
+  - products-wolframalpha-com
+
+skills: []
+mcp_servers: []
+
+hermes_config_patch:
+  model:
+    default: llama-3.3-70b
+    provider: custom
+    base_url: http://127.0.0.1:8402/v1

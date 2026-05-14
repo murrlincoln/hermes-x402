@@ -26,7 +26,7 @@ import {
   walletFromPrivateKey,
 } from '../lib/wallet.js'
 import { WALLET_PROVIDERS, type ProviderId } from '../lib/wallet-providers.js'
-import { select, password, confirm } from '@inquirer/prompts'
+import { select, password, confirm, checkbox } from '@inquirer/prompts'
 import { getVeniceClient, fetchBalance } from '../lib/venice.js'
 import {
   spendSince,
@@ -40,6 +40,25 @@ import {
   HERMES_CONFIG,
   DEFAULT_BRIDGE_PORT,
 } from '../lib/paths.js'
+import {
+  fetchCatalog,
+  groupByCategory,
+  searchServices,
+  formatPrice,
+  addSelectedService,
+  removeSelectedService,
+  loadSkillsConfig,
+  getSelectedServiceIds,
+  CATEGORIES,
+  type MarketplaceService,
+} from '../lib/marketplace.js'
+import { getUsdcBalance, formatUsdc } from '../lib/onchain.js'
+import {
+  writeSkillFiles,
+  cleanStaleSkillFiles,
+  generateIndexSkill,
+  getSkillsDir,
+} from '../lib/skills-generator.js'
 
 const PID_FILE = join(X402_HOME, 'bridge.pid')
 const LOG_FILE = join(X402_HOME, 'bridge.log')
@@ -59,20 +78,22 @@ program
 
 program
   .command('init')
-  .description('Interactive onboarding: pick a wallet, pick a bundle, fund')
+  .description('Full onboarding: wallet → skills marketplace → inference bundle → fund → auto-configure')
   .option('-b, --bundle <name>', 'Skip the bundle picker and install this one')
-  .option('-y, --yes', 'Non-interactive: defaults (generate wallet, starter bundle)')
+  .option('-y, --yes', 'Non-interactive: defaults (generate wallet, starter bundle, no marketplace)')
   .option('--no-patch', 'Skip patching ~/.hermes/config.yaml')
+  .option('--skip-marketplace', 'Skip the skill marketplace step')
   .action(async (opts) => {
     const nonInteractive = opts.yes === true || !process.stdin.isTTY
 
     console.log()
     console.log(chalk.bold('  Welcome to hermes-x402.'))
-    console.log(chalk.dim('  Wallet-funded onboarding for Hermes Agent — no API keys.'))
+    console.log(chalk.dim('  Wallet-funded agent setup — no API keys needed.'))
+    console.log(chalk.dim('  Your agent gets a wallet, picks skills, and is ready to go.'))
     console.log()
 
-    // ── Step 1 of 3: Wallet ────────────────────────────────────────────
-    sectionHeader('Step 1 of 3', 'Wallet')
+    // ── Step 1 of 5: Wallet ────────────────────────────────────────────
+    sectionHeader('Step 1 of 5', 'Wallet')
 
     if (walletExists()) {
       const w = loadWallet()
@@ -88,9 +109,54 @@ program
       await setupWallet(providerId)
     }
 
-    // ── Step 2 of 3: Inference & skills ─────────────────────────────────
+    // ── Step 2 of 5: Check on-chain balance ────────────────────────────
     console.log()
-    sectionHeader('Step 2 of 3', 'Inference & skills')
+    sectionHeader('Step 2 of 5', 'Wallet balance')
+
+    const wallet = loadWallet()
+    const balSpin = ora('Checking on-chain USDC balance on Base').start()
+    try {
+      const onChainBalance = await getUsdcBalance(wallet.address)
+      balSpin.stop()
+      console.log(`  ${chalk.bold('address:')}  ${chalk.cyan(wallet.address)}`)
+      console.log(`  ${chalk.bold('USDC:')}     ${onChainBalance > 0 ? chalk.green(formatUsdc(onChainBalance)) : chalk.yellow('$0.00')}`)
+      console.log(`  ${chalk.bold('network:')}  Base mainnet`)
+      if (onChainBalance === 0) {
+        console.log()
+        console.log(chalk.yellow('  No USDC detected. Send USDC on Base to this address to use paid services.'))
+        console.log(chalk.dim(`  You can continue setup now and fund later.`))
+      }
+    } catch (err) {
+      balSpin.fail(`Could not check balance: ${(err as Error).message}`)
+      console.log(chalk.dim('  Continuing setup — you can check later with `x402 balance`'))
+    }
+
+    // ── Step 3 of 5: Skill marketplace ─────────────────────────────────
+    if (!nonInteractive && !opts.skipMarketplace) {
+      console.log()
+      sectionHeader('Step 3 of 5', 'x402 Skills Marketplace')
+      console.log(chalk.dim('  Browse paid API services your agent can use. Each call is paid from your wallet.'))
+      console.log()
+
+      const wantSkills = await confirm({
+        message: 'Browse the x402 skills marketplace?',
+        default: true,
+      }).catch(() => false)
+
+      if (wantSkills) {
+        await interactiveSkillBrowser()
+      } else {
+        console.log(chalk.dim('  Skipped. You can browse later with `x402 marketplace`'))
+      }
+    } else {
+      console.log()
+      sectionHeader('Step 3 of 5', 'x402 Skills Marketplace')
+      console.log(chalk.dim('  Skipped (non-interactive mode). Use `x402 marketplace` to browse later.'))
+    }
+
+    // ── Step 4 of 5: Inference bundle ──────────────────────────────────
+    console.log()
+    sectionHeader('Step 4 of 5', 'Inference bundle')
 
     const bundleName: string =
       opts.bundle ?? (nonInteractive ? 'starter' : await pickBundle())
@@ -105,36 +171,96 @@ program
       console.log(chalk.dim('  (--no-patch given, leaving Hermes config alone)'))
     }
 
-    // ── Step 3 of 3: Fund ───────────────────────────────────────────────
-    console.log()
-    sectionHeader('Step 3 of 3', 'Fund the wallet')
-
-    const w = loadWallet()
-    console.log(`  ${chalk.bold('address:')}  ${chalk.cyan(w.address)}`)
-    console.log(`  ${chalk.bold('network:')}  Base mainnet`)
-    console.log(
-      `  ${chalk.bold('asset:')}    USDC  ${chalk.dim('(0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913)')}`,
-    )
-    console.log(`  ${chalk.bold('amount:')}   $5+ to start`)
-
-    if (!nonInteractive) {
-      const showQr = await confirm({
-        message: 'Show a QR code for the address?',
-        default: false,
-      }).catch(() => false)
-      if (showQr) {
-        console.log()
-        qrcode.generate(w.address, { small: true })
+    if (bundle.x402_skills && bundle.x402_skills.length > 0) {
+      const bundleSkillsSpin = ora('Adding x402 skills from bundle').start()
+      try {
+        const catalog = await fetchCatalog()
+        let added = 0
+        for (const skillId of bundle.x402_skills) {
+          const service = catalog.find((s) => s.id === skillId)
+          if (service) {
+            addSelectedService(service)
+            added++
+          }
+        }
+        bundleSkillsSpin.succeed(`Added ${added} skill${added !== 1 ? 's' : ''} from ${bundle.name} bundle`)
+      } catch {
+        bundleSkillsSpin.warn('Could not fetch marketplace catalog for bundle skills')
       }
     }
 
+    // ── Step 5 of 5: Auto-configure ────────────────────────────────────
     console.log()
-    console.log(chalk.bold.green('  Done. When funds arrive:'))
-    console.log(`    ${chalk.bold('x402 balance')}              confirm funds arrived`)
-    console.log(`    ${chalk.bold('x402 topup 5')}              convert on-chain USDC → Venice balance`)
-    console.log(`    ${chalk.bold('x402 start --daemon')}       run the bridge in the background`)
-    console.log(`    ${chalk.bold('x402 install-mcp')}          register the x402_fetch tool with Hermes`)
-    console.log(`    ${chalk.bold('hermes')}                    talk to your agent`)
+    sectionHeader('Step 5 of 5', 'Auto-configure Hermes')
+
+    const skillsConfig = loadSkillsConfig()
+    if (skillsConfig.selectedServices.length > 0) {
+      const skillSpin = ora('Generating x402 skill files for Hermes').start()
+      const written = writeSkillFiles(skillsConfig.selectedServices)
+      generateIndexSkill(skillsConfig.selectedServices)
+      const currentIds = new Set(skillsConfig.selectedServices.map((s) => s.id))
+      cleanStaleSkillFiles(currentIds)
+      skillSpin.succeed(`Generated ${written.length} skill file${written.length !== 1 ? 's' : ''} at ${getSkillsDir()}`)
+    } else {
+      console.log(chalk.dim('  No marketplace skills selected. Agent will have x402_fetch for manual use.'))
+    }
+
+    // Auto-install MCP server
+    if (existsSync(HERMES_CONFIG)) {
+      const serverPath = join(PROJECT_ROOT, 'src', 'mcp', 'server.ts')
+      if (existsSync(serverPath)) {
+        const mcpSpin = ora('Registering x402 MCP server with Hermes').start()
+        const backup = HERMES_CONFIG + '.bak.' + Date.now()
+        copyFileSync(HERMES_CONFIG, backup)
+        const result = upsertMcpServer(
+          readFileSync(HERMES_CONFIG, 'utf-8'),
+          'hermes-x402',
+          'npx',
+          ['tsx', serverPath],
+        )
+        writeFileSync(HERMES_CONFIG, result.text)
+        mcpSpin.succeed(`${result.action} hermes-x402 MCP server`)
+        console.log(chalk.dim(`    (backup: ${backup})`))
+      }
+    } else {
+      console.log(chalk.dim('  Hermes config not found — run `hermes setup` first, then `x402 install-mcp`'))
+    }
+
+    // Final summary
+    console.log()
+    console.log(chalk.bold.green('  ✓ Setup complete!'))
+    console.log()
+
+    const sc = loadSkillsConfig()
+    if (sc.selectedServices.length > 0) {
+      console.log(chalk.bold('  Selected skills:'))
+      for (const s of sc.selectedServices) {
+        console.log(`    ${chalk.cyan('•')} ${s.name} (${s.endpoints.length} endpoint${s.endpoints.length !== 1 ? 's' : ''})`)
+      }
+      console.log()
+    }
+
+    console.log(chalk.bold('  Next steps:'))
+    try {
+      const bal = await getUsdcBalance(wallet.address)
+      if (bal === 0) {
+        console.log(`    ${chalk.bold('1.')} Send USDC on Base to ${chalk.cyan(wallet.address)}`)
+        console.log(`    ${chalk.bold('2.')} ${chalk.bold('x402 topup 5')}      convert on-chain USDC → Venice balance`)
+        console.log(`    ${chalk.bold('3.')} ${chalk.bold('x402 start --daemon')} run the bridge`)
+        console.log(`    ${chalk.bold('4.')} ${chalk.bold('hermes')}             talk to your agent`)
+      } else {
+        console.log(`    ${chalk.bold('1.')} ${chalk.bold('x402 topup 5')}      convert on-chain USDC → Venice balance`)
+        console.log(`    ${chalk.bold('2.')} ${chalk.bold('x402 start --daemon')} run the bridge`)
+        console.log(`    ${chalk.bold('3.')} ${chalk.bold('hermes')}             talk to your agent`)
+      }
+    } catch {
+      console.log(`    ${chalk.bold('x402 balance')}              check wallet funds`)
+      console.log(`    ${chalk.bold('x402 start --daemon')}       run the bridge`)
+      console.log(`    ${chalk.bold('hermes')}                    talk to your agent`)
+    }
+    console.log()
+    console.log(chalk.dim('  Manage skills anytime: x402 marketplace'))
+    console.log(chalk.dim('  Check spending:        x402 spend'))
     console.log()
   })
 
@@ -533,14 +659,128 @@ program
     console.log(chalk.dim('reload Hermes (Ctrl-C and rerun `hermes`) to pick it up'))
   })
 
+// ------------------------------------------------------------------------
+// marketplace
+// ------------------------------------------------------------------------
+
+const marketplace = program
+  .command('marketplace')
+  .description('Browse and manage x402 skills from agentic.market')
+
+marketplace
+  .command('browse')
+  .description('Interactive skill browser — pick services to add to your agent')
+  .action(async () => {
+    await interactiveSkillBrowser()
+  })
+
+marketplace
+  .command('search <query>')
+  .description('Search the marketplace by name or description')
+  .action(async (query: string) => {
+    const spin = ora('Searching marketplace').start()
+    try {
+      const catalog = await fetchCatalog()
+      spin.stop()
+      const results = searchServices(catalog, query)
+      if (results.length === 0) {
+        console.log(chalk.dim(`  No services matching "${query}"`))
+        return
+      }
+      const selectedIds = getSelectedServiceIds()
+      console.log(chalk.bold(`  ${results.length} result${results.length !== 1 ? 's' : ''} for "${query}":\n`))
+      for (const s of results.slice(0, 20)) {
+        const installed = selectedIds.has(s.id) ? chalk.green(' ✓') : ''
+        const price = formatPrice(s)
+        console.log(`  ${chalk.bold(s.name.padEnd(24))} ${chalk.dim(price.padEnd(12))} ${s.description.slice(0, 60)}${installed}`)
+      }
+      if (results.length > 20) {
+        console.log(chalk.dim(`\n  ...and ${results.length - 20} more. Refine your search.`))
+      }
+    } catch (err) {
+      spin.fail((err as Error).message)
+    }
+  })
+
+marketplace
+  .command('add <serviceId>')
+  .description('Add a service to your agent by ID')
+  .action(async (serviceId: string) => {
+    const spin = ora('Fetching service info').start()
+    try {
+      const catalog = await fetchCatalog()
+      const service = catalog.find((s) => s.id === serviceId)
+      if (!service) {
+        spin.fail(`Service "${serviceId}" not found. Use \`x402 marketplace search\` to find services.`)
+        return
+      }
+      addSelectedService(service)
+      spin.succeed(`Added ${chalk.cyan(service.name)} (${service.endpoints.length} endpoints)`)
+      regenerateSkillFiles()
+    } catch (err) {
+      spin.fail((err as Error).message)
+    }
+  })
+
+marketplace
+  .command('remove <serviceId>')
+  .description('Remove a service from your agent')
+  .action((serviceId: string) => {
+    removeSelectedService(serviceId)
+    regenerateSkillFiles()
+    console.log(`Removed ${chalk.cyan(serviceId)}`)
+  })
+
+marketplace
+  .command('list')
+  .description('Show services currently added to your agent')
+  .action(() => {
+    const config = loadSkillsConfig()
+    if (config.selectedServices.length === 0) {
+      console.log(chalk.dim('  No services selected. Use `x402 marketplace browse` to add some.'))
+      return
+    }
+    console.log(chalk.bold(`  ${config.selectedServices.length} selected service${config.selectedServices.length !== 1 ? 's' : ''}:\n`))
+    for (const s of config.selectedServices) {
+      console.log(`  ${chalk.cyan('•')} ${chalk.bold(s.name.padEnd(24))} ${s.endpoints.length} endpoint${s.endpoints.length !== 1 ? 's' : ''}  ${chalk.dim(s.category)}`)
+    }
+  })
+
+marketplace
+  .command('refresh')
+  .description('Refresh the marketplace catalog cache')
+  .action(async () => {
+    const spin = ora('Refreshing marketplace catalog').start()
+    try {
+      const catalog = await fetchCatalog(true)
+      spin.succeed(`Loaded ${catalog.length} services from agentic.market`)
+    } catch (err) {
+      spin.fail((err as Error).message)
+    }
+  })
+
+// ------------------------------------------------------------------------
+// info
+// ------------------------------------------------------------------------
+
 program
   .command('info')
   .description('Show config paths and current state')
-  .action(() => {
+  .action(async () => {
     console.log(`${chalk.bold('X402_HOME:')}      ${X402_HOME}`)
     console.log(`${chalk.bold('wallet:')}         ${WALLET_PATH}  ${existsSync(WALLET_PATH) ? chalk.green('(present)') : chalk.red('(missing)')}`)
     console.log(`${chalk.bold('hermes config:')}  ${HERMES_CONFIG}  ${existsSync(HERMES_CONFIG) ? chalk.green('(present)') : chalk.red('(missing)')}`)
     console.log(`${chalk.bold('bridge port:')}    ${DEFAULT_BRIDGE_PORT}`)
+    console.log(`${chalk.bold('skills dir:')}     ${getSkillsDir()}`)
+    const config = loadSkillsConfig()
+    console.log(`${chalk.bold('skills:')}         ${config.selectedServices.length} selected`)
+    if (walletExists()) {
+      try {
+        const w = loadWallet()
+        const bal = await getUsdcBalance(w.address)
+        console.log(`${chalk.bold('USDC balance:')}   ${formatUsdc(bal)} (on-chain, Base)`)
+      } catch { /* ignore */ }
+    }
   })
 
 program.parseAsync().catch((err) => {
@@ -557,6 +797,7 @@ interface Bundle {
   version?: string
   description?: string
   hermes_config_patch?: Record<string, unknown>
+  x402_skills?: string[]
 }
 
 function loadBundle(name: string): Bundle {
@@ -863,11 +1104,128 @@ function upsertMcpServer(
 
 function formatYamlScalar(v: unknown): string {
   if (typeof v === 'string') {
-    // Always quote strings to avoid yaml ambiguity (e.g. "yes", "true", IP-like)
     return `"${v.replace(/"/g, '\\"')}"`
   }
   if (typeof v === 'number' || typeof v === 'boolean' || v === null) {
     return String(v)
   }
   return JSON.stringify(v)
+}
+
+function regenerateSkillFiles(): void {
+  const config = loadSkillsConfig()
+  writeSkillFiles(config.selectedServices)
+  generateIndexSkill(config.selectedServices)
+  const currentIds = new Set(config.selectedServices.map((s) => s.id))
+  cleanStaleSkillFiles(currentIds)
+}
+
+async function interactiveSkillBrowser(): Promise<void> {
+  const spin = ora('Loading marketplace catalog from agentic.market').start()
+  let catalog: MarketplaceService[]
+  try {
+    catalog = await fetchCatalog()
+    spin.succeed(`Loaded ${catalog.length} services`)
+  } catch (err) {
+    spin.fail(`Could not load marketplace: ${(err as Error).message}`)
+    return
+  }
+
+  const grouped = groupByCategory(catalog)
+  let browsing = true
+
+  while (browsing) {
+    console.log()
+    const selectedIds = getSelectedServiceIds()
+    const selectedCount = selectedIds.size
+
+    const action = await select<string>({
+      message: `Skills marketplace${selectedCount > 0 ? chalk.green(` (${selectedCount} selected)`) : ''}`,
+      choices: [
+        ...CATEGORIES
+          .filter((cat) => grouped.has(cat.id))
+          .map((cat) => {
+            const services = grouped.get(cat.id)!
+            const installedInCat = services.filter((s) => selectedIds.has(s.id)).length
+            const suffix = installedInCat > 0 ? chalk.green(` (${installedInCat} selected)`) : ''
+            return {
+              name: `${cat.emoji}  ${cat.label}  ${chalk.dim(`(${services.length})`)}${suffix}`,
+              value: `cat:${cat.id}`,
+            }
+          }),
+        { name: chalk.dim('─'.repeat(40)), value: 'sep', disabled: true },
+        { name: `🔍  Search by name`, value: 'search' },
+        {
+          name: selectedCount > 0
+            ? `${chalk.green('✓')}  Done (${selectedCount} selected)`
+            : `✓  Done`,
+          value: 'done',
+        },
+      ],
+    }).catch(() => 'done')
+
+    if (action === 'done' || action === 'sep') {
+      browsing = false
+      continue
+    }
+
+    if (action === 'search') {
+      const { input } = await import('@inquirer/prompts')
+      const query = await input({ message: 'Search:' }).catch(() => '')
+      if (!query) continue
+      const results = searchServices(catalog, query)
+      if (results.length === 0) {
+        console.log(chalk.dim(`  No results for "${query}"`))
+        continue
+      }
+      await pickServicesFromList(results, `Results for "${query}"`)
+      continue
+    }
+
+    if (action.startsWith('cat:')) {
+      const catId = action.slice(4)
+      const catInfo = CATEGORIES.find((c) => c.id === catId)
+      const services = grouped.get(catId) ?? []
+      await pickServicesFromList(services, catInfo?.label ?? catId)
+    }
+  }
+
+  const finalConfig = loadSkillsConfig()
+  if (finalConfig.selectedServices.length > 0) {
+    console.log()
+    console.log(chalk.bold(`  ${finalConfig.selectedServices.length} skill${finalConfig.selectedServices.length !== 1 ? 's' : ''} selected:`))
+    for (const s of finalConfig.selectedServices) {
+      console.log(`    ${chalk.cyan('•')} ${s.name}`)
+    }
+  }
+}
+
+async function pickServicesFromList(services: MarketplaceService[], title: string): Promise<void> {
+  const selectedIds = getSelectedServiceIds()
+
+  const maxServices = 30
+  const displayServices = services.slice(0, maxServices)
+
+  const chosen = await checkbox<string>({
+    message: `${title} — toggle services (space to select, enter to confirm)`,
+    choices: displayServices.map((s) => ({
+      name: `${s.name.padEnd(24)} ${chalk.dim(formatPrice(s).padEnd(10))} ${s.description.slice(0, 50)}`,
+      value: s.id,
+      checked: selectedIds.has(s.id),
+    })),
+  }).catch(() => [] as string[])
+
+  const chosenSet = new Set(chosen)
+
+  for (const s of displayServices) {
+    if (chosenSet.has(s.id) && !selectedIds.has(s.id)) {
+      addSelectedService(s)
+    } else if (!chosenSet.has(s.id) && selectedIds.has(s.id)) {
+      removeSelectedService(s.id)
+    }
+  }
+
+  if (services.length > maxServices) {
+    console.log(chalk.dim(`  Showing first ${maxServices} of ${services.length}. Use \`x402 marketplace search\` for more.`))
+  }
 }

@@ -1,0 +1,44 @@
+name: builder
+version: 0.0.1
+description: |
+  Full-stack agent bundle. Inference + search + code sandboxes + communication.
+  Everything a developer agent needs.
+
+provider: venice
+chain: base
+spend_asset: USDC
+
+endpoints:
+  - kind: openai-compatible
+    via: bridge
+    url: http://127.0.0.1:8402/v1
+
+models:
+  - id: llama-3.3-70b
+    role: primary
+    notes: fast and capable
+  - id: qwen3-235b-a22b-instruct-2507
+    role: heavy_moe
+    notes: strong at code and reasoning
+  - id: hermes-3-llama-3.1-405b
+    role: heavy
+    notes: flagship
+
+est_cost_per_hour_usdc: 0.25
+
+x402_skills:
+  - exa-ai
+  - api-firecrawl-dev
+  - e2b-dev
+  - stableemail-dev
+  - developers-deepgram-com
+  - docs-perplexity-ai
+
+skills: []
+mcp_servers: []
+
+hermes_config_patch:
+  model:
+    default: llama-3.3-70b
+    provider: custom
+    base_url: http://127.0.0.1:8402/v1
